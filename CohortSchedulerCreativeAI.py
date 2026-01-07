@@ -275,7 +275,7 @@ PRESETS = {
 
 st.set_page_config(page_title="Cohort Scheduler", page_icon="📚", layout="wide")
 
-st.title("📚 Cohort Scheduler with Custom Prerequisites")
+st.title("📚   Creative AI Cohort Scheduler with Custom Prerequisites")
 st.markdown("Configure module prerequisites and run the scheduling optimization.")
 
 # Module names mapping
