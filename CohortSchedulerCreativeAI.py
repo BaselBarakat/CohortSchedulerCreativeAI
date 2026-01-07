@@ -1,0 +1,938 @@
+"""
+Streamlit Cohort Scheduler with Customizable Prerequisites
+Run with: streamlit run app.py
+"""
+
+import streamlit as st
+from collections import defaultdict
+from typing import Dict, List, Optional, Any, Set
+from dataclasses import dataclass
+import csv
+import io
+import sys
+import networkx as nx  # Added for dependency cycle detection
+
+TERM_DATES = [
+    "08-Jun-26", "31-Aug-26", "26-Oct-26",
+    "04-Jan-27", "01-Mar-27", "03-May-27",
+    "08-Jun-27", "28-Jun-27", "30-Aug-27",
+    "31-Aug-27", "25-Oct-27", "26-Oct-27",
+    "03-Jan-28", "04-Jan-28", "28-Feb-28",
+    "01-Mar-28", "01-May-28", "03-May-28",
+    "26-Jun-28", "28-Jun-28", "28-Aug-28",
+    "30-Aug-28", "25-Oct-28", "03-Jan-29",
+    "28-Feb-29", "01-Mar-29"
+]
+
+# Helper function to get term date
+def get_term_date(term: int) -> str:
+    if 1 <= term <= len(TERM_DATES):
+        return TERM_DATES[term-1]
+    return f"T{term}"
+
+
+# ========== SCHEDULER CLASSES ==========
+
+@dataclass
+class SchedulerConfig:
+    max_terms: int = 100
+    max_modules_per_cohort_per_term: int = 1
+    verbose: bool = False
+
+class CohortScheduler:
+    def __init__(self, modules: List[str], prereqs: Dict[str, List[str]], 
+                 cohort_starts: Dict[str, int], config: Optional[SchedulerConfig] = None):
+        self.config = config or SchedulerConfig()
+        self.modules = modules
+        self.prereqs = prereqs
+        self.cohort_starts = cohort_starts
+        self.cohorts = list(cohort_starts.keys())
+        self._reset_schedule()
+    
+    def _reset_schedule(self):
+        self.schedule = defaultdict(lambda: defaultdict(list))
+        self.cohort_progress = {c: {} for c in self.cohorts}
+        self.module_runs = {m: [] for m in self.modules}
+        self.cohort_last_active = {c: 0 for c in self.cohorts}
+        self.cohort_module_count = {c: defaultdict(int) for c in self.cohorts}
+    
+    def can_take_module(self, cohort: str, module: str, term: int) -> bool:
+        """Check if a cohort can take a module in a given term"""
+        # Basic checks
+        if term < self.cohort_starts[cohort]:
+            return False
+        if self.cohort_module_count[cohort][term] >= self.config.max_modules_per_cohort_per_term:
+            return False
+        if module in self.cohort_progress[cohort]:
+            return False
+        
+        # Check prerequisites
+        for prereq in self.prereqs.get(module, []):
+            # Skip invalid prerequisites not in our module list
+            if prereq not in self.modules:
+                continue
+            if prereq not in self.cohort_progress[cohort]:
+                return False
+            if self.cohort_progress[cohort][prereq] >= term:
+                return False
+        return True
+    
+    def schedule_module_run(self, module: str, term: int, cohorts: List[str]):
+        """Schedule a module run for multiple cohorts"""
+        self.schedule[term][module].extend(cohorts)
+        for cohort in cohorts:
+            self.cohort_progress[cohort][module] = term
+            self.cohort_last_active[cohort] = max(self.cohort_last_active[cohort], term)
+            self.cohort_module_count[cohort][term] += 1
+        if term not in self.module_runs[module]:
+            self.module_runs[module].append(term)
+    
+    def detect_cycles(self) -> List[List[str]]:
+        """Detect cycles in prerequisites using networkx"""
+        G = nx.DiGraph()
+        for module in self.modules:
+            G.add_node(module)
+            for prereq in self.prereqs.get(module, []):
+                if prereq in self.modules:  # Only consider valid modules
+                    G.add_edge(prereq, module)
+        
+        try:
+            cycles = list(nx.simple_cycles(G))
+            return cycles
+        except nx.NetworkXError:
+            return []
+    
+    def find_optimal_schedule(self) -> bool:
+        """Find an optimal schedule for all cohorts"""
+        # First check for dependency cycles
+        cycles = self.detect_cycles()
+        if cycles:
+            error_msg = "❌ Found circular dependencies in prerequisites:\n"
+            for cycle in cycles:
+                error_msg += f"  → {' → '.join(cycle)} → {cycle[0]}\n"
+            error_msg += "Please fix these cycles before scheduling."
+            st.error(error_msg)
+            return False
+        
+        self._reset_schedule()
+        cohort_needs = {c: set(self.modules) for c in self.cohorts}
+        
+        # Track unscheduled modules to detect impossible schedules
+        unscheduled_modules = set(self.modules)
+        
+        for term in range(1, self.config.max_terms + 1):
+            active_cohorts = [
+                c for c in self.cohorts
+                if term >= self.cohort_starts[c] 
+                and cohort_needs[c]
+                and self.cohort_module_count[c][term] < self.config.max_modules_per_cohort_per_term
+            ]
+            
+            if not active_cohorts:
+                continue
+            
+            scheduled_this_term = set()
+            term_scheduled = False
+            
+            # Try to schedule modules for this term
+            while active_cohorts:
+                unscheduled = [c for c in active_cohorts if c not in scheduled_this_term]
+                if not unscheduled:
+                    break
+                
+                # Find best module to schedule
+                module_scores = []
+                for module in sorted(unscheduled_modules):  # Sort for deterministic behavior
+                    if module not in cohort_needs[unscheduled[0]]:
+                        continue
+                    
+                    eligible = [c for c in unscheduled if self.can_take_module(c, module, term)]
+                    
+                    if eligible:
+                        score = len(eligible)
+                        module_scores.append((score, module, eligible))
+                
+                if not module_scores:
+                    break
+                
+                # Select module with most eligible cohorts
+                module_scores.sort(reverse=True, key=lambda x: x[0])
+                _, best_module, eligible_cohorts = module_scores[0]
+                
+                self.schedule_module_run(best_module, term, eligible_cohorts)
+                term_scheduled = True
+                
+                # Update cohort needs
+                for cohort in eligible_cohorts:
+                    cohort_needs[cohort].discard(best_module)
+                    scheduled_this_term.add(cohort)
+                
+                # Remove module from unscheduled if all cohorts can take it eventually
+                if all(best_module not in cohort_needs[c] for c in self.cohorts):
+                    unscheduled_modules.discard(best_module)
+            
+            # Early termination if nothing was scheduled this term
+            if not term_scheduled:
+                break
+        
+        # Check completion status
+        all_modules_scheduled = all(len(self.cohort_progress[c]) == len(self.modules) for c in self.cohorts)
+        
+        # Handle incomplete schedules
+        if not all_modules_scheduled:
+            incomplete_cohorts = [c for c in self.cohorts if len(self.cohort_progress[c]) < len(self.modules)]
+            missing_modules = {}
+            for cohort in incomplete_cohorts:
+                missing = set(self.modules) - set(self.cohort_progress[cohort].keys())
+                missing_modules[cohort] = missing
+            
+            warning_msg = "⚠️ Schedule incomplete. The following cohorts couldn't finish all modules:\n"
+            for cohort, modules in missing_modules.items():
+                warning_msg += f"- Cohort {cohort}: Missing {', '.join(sorted(modules))}\n"
+            warning_msg += "\nPossible causes:\n"
+            warning_msg += "- Prerequisites create impossible sequences\n"
+            warning_msg += "- Not enough terms allocated\n"
+            warning_msg += "- Too few modules allowed per term"
+            st.warning(warning_msg)
+        
+        return all_modules_scheduled
+    
+    def get_schedule_summary(self) -> Dict[str, Any]:
+        total_runs = sum(len(runs) for runs in self.module_runs.values())
+        max_term = max(self.cohort_last_active.values()) if self.cohort_last_active else 0
+        
+        return {
+            'total_runs': total_runs,
+            'max_term': max_term,
+            'module_runs': {m: len(runs) for m, runs in self.module_runs.items()},
+            'cohort_progress': self.cohort_progress,
+            'schedule': self.schedule
+        }
+
+# ========== PRESET DEFINITIONS ==========
+
+PRESETS = {
+    "No Prerequisites (just project)": {
+        'M1': [], 'M2': [], 'M3': [], 'M4': [], 'M5': [], 'M6': [],
+        'M7': [], 'M8': [], 'M9': [],
+        'M10': ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8', 'M9'],
+        'M11': ['M10'],
+        'M12': ['M11']
+    },
+    "Phase-Based": {
+        'M1': [], 'M2': [], 'M3': [], 'M4': [],#phase one
+        'M5': ['M1','M2', 'M3', 'M4'],
+        'M6': ['M1','M2', 'M3', 'M4'],
+        'M7': ['M1','M2', 'M3', 'M4'],
+        'M8': ['M1','M2', 'M3', 'M4'],
+        'M9': ['M5', 'M6', 'M7', 'M8'],
+        'M10': ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8', 'M9'],
+        'M11': ['M10'],
+        'M12': ['M11']
+    },
+    "Logical": {
+        'M1': [], 'M2': [], 'M3': [],
+        'M4': ['M2', 'M3'],
+        'M5': ['M4'],
+        'M6': ['M5'],
+        'M7': ['M6'],
+        'M8': ['M6'],
+        'M9': ['M5'],
+        'M10': ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8', 'M9'],
+        'M11': ['M10'],
+        'M12': ['M11']
+    },
+    
+        "Logical (no project)": {
+        'M1': [], 'M2': [], 'M3': [],
+        'M4': ['M2', 'M3'],
+        'M5': ['M4'],
+        'M6': ['M5'],
+        'M7': ['M6'],
+        'M8': ['M6'],
+        'M9': ['M5'],
+        'M10': ['M1', 'M2', 'M3', 'M4', 'M5', 'M6'],
+        'M11': ['M10'],
+        'M12': ['M11']
+    },
+    "Sequental": {
+        'M1': [], 'M2': ['M1'], 'M3': ['M2'],
+        'M4': ['M3'],
+        'M5': ['M4'],
+        'M6': ['M5'],
+        'M7': ['M6'],
+        'M8': ['M7'],
+        'M9': ['M8'],
+        'M10': ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8', 'M9'],
+        'M11': ['M10'],
+        'M12': ['M11']
+    }
+}
+
+# ========== STREAMLIT APP ==========
+
+st.set_page_config(page_title="Cohort Scheduler", page_icon="📚", layout="wide")
+
+st.title("📚 Cohort Scheduler with Custom Prerequisites")
+st.markdown("Configure module prerequisites and run the scheduling optimization.")
+
+# Module names mapping
+module_names = {
+    'M1': 'Introduction to Creative AI',
+    'M2': 'Collaborative Prototyping and Practice',
+    'M3': 'More-Than-Human Creativity: Proposal Development',
+    'M4': 'Creative AI: Intermedial Learning Systems',
+    'M5': 'Portfolio I',
+    'M6': 'Portfolio II',
+    'M7': 'Portfolio III',
+    'M8': 'Portfolio IV',
+    'M9': 'Final Project 1',
+    'M10': 'Final Project 2',
+    'M11': 'Final Project 3',
+    'M12': 'Final Project 3',
+}
+
+modules = [f'M{i}' for i in range(1, 13)]
+
+# Initialize session state with proper defaults
+if 'prereqs' not in st.session_state:
+    st.session_state.prereqs = PRESETS["No Prerequisites (just project)"].copy()
+    # Ensure all modules exist in prerequisites
+    for module in modules:
+        if module not in st.session_state.prereqs:
+            st.session_state.prereqs[module] = []
+
+# Sidebar for preset configurations
+st.sidebar.header("⚙️ Configuration Presets")
+
+preset = st.sidebar.selectbox(
+    "Load Preset:",
+    ["Custom", "No Prerequisites (just project)", "Phase-Based", "Sequental","Logical","Logical (no project)"],
+    key="preset_selector"
+)
+
+# Reset to initial state button
+if st.sidebar.button("↩️ Reset to Initial"):
+    st.session_state.prereqs = PRESETS["No Prerequisites (just project)"].copy()
+    # Ensure all modules exist after reset
+    for module in modules:
+        if module not in st.session_state.prereqs:
+            st.session_state.prereqs[module] = []
+    st.success("✅ Reset to initial configuration!")
+    st.rerun()
+
+# Load preset button - FIXED THE LOGIC HERE
+if st.sidebar.button("✅ Load Preset"):
+    if preset != "Custom" and preset in PRESETS:
+        # Clear existing prerequisites first
+        st.session_state.prereqs = {}
+        # Load the selected preset
+        st.session_state.prereqs = PRESETS[preset].copy()
+        # Ensure all modules exist after loading preset
+        for module in modules:
+            if module not in st.session_state.prereqs:
+                st.session_state.prereqs[module] = []
+        st.sidebar.success(f"✅ {preset} preset loaded!")
+        # Force a rerun to update the UI immediately
+        st.rerun()
+    else:
+        st.sidebar.info("Custom configuration preserved or preset not found")
+
+# Main content tabs
+tab1, tab2, tab3 = st.tabs(["📝 Edit Prerequisites", "▶️ Run Scheduler", "📊 Results"])
+
+with tab1:
+    st.header("Configure Module Prerequisites")
+    st.markdown("Select which modules are required before each module can be taken.")
+    
+    # Edit mode selector
+    edit_mode = st.radio(
+        "Edit Mode:",
+        ["Individual Module Editor (Recommended)", "Table View"],
+        horizontal=True,
+        key="edit_mode"
+    )
+    
+    if edit_mode == "Table View":
+        st.markdown("**Check the boxes to set prerequisites. Rows = modules, Columns = prerequisites**")
+        st.caption("💡 Tip: Use the individual editor for complex configurations")
+        
+        # Create scrollable container for the large table
+        with st.container():
+            # Column headers
+            header_cols = st.columns([2.5] + [0.8] * len(modules))
+            header_cols[0].markdown("**Module**")
+            for i, mod in enumerate(modules):
+                header_cols[i+1].markdown(f"**{mod}**", help=module_names[mod])
+            
+            # Create rows for each module with scrollable container
+            for module in modules:
+                cols = st.columns([2.5] + [0.8] * len(modules))
+                cols[0].markdown(f"**{module}** - {module_names[module]}")
+                
+                # Checkboxes for each potential prerequisite
+                for i, potential_prereq in enumerate(modules):
+                    if potential_prereq == module:
+                        cols[i+1].markdown("—", help="A module cannot be its own prerequisite")
+                    else:
+                        current_prereqs = st.session_state.prereqs.get(module, [])
+                        is_checked = potential_prereq in current_prereqs
+                        
+                        checked = cols[i+1].checkbox(
+                            "",
+                            value=is_checked,
+                            key=f"prereq_{module}_{potential_prereq}",
+                            label_visibility="collapsed"
+                        )
+                        
+                        # Update session state
+                        if checked and potential_prereq not in current_prereqs:
+                            st.session_state.prereqs[module].append(potential_prereq)
+                        elif not checked and potential_prereq in current_prereqs:
+                            st.session_state.prereqs[module].remove(potential_prereq)
+            
+            # Add vertical space after table
+            st.markdown("<br>", unsafe_allow_html=True)
+    
+    else:  # Individual Module Editor (default)
+        st.markdown("**Select prerequisites for each module individually**")
+        st.caption("💡 Tip: Start with foundational modules (M1-M4) before configuring advanced ones")
+        
+        # Create expanders for each module
+        for module in modules:
+            with st.expander(f"{module} - {module_names[module]}"):
+                # Get available prerequisites (all modules except itself)
+                available_prereqs = [m for m in modules if m != module]
+                
+                # Format options with module names
+                formatted_options = [f"{m} - {module_names[m]}" for m in available_prereqs]
+                
+                # Get current selections with proper formatting
+                current_selections = st.session_state.prereqs.get(module, [])
+                formatted_selections = [f"{m} - {module_names[m]}" for m in current_selections]
+                
+                # Multiselect with formatted display
+                selected = st.multiselect(
+                    f"Prerequisites for {module}:",
+                    formatted_options,
+                    default=formatted_selections,
+                    key=f"multi_{module}"
+                )
+                
+                # Convert back to module codes
+                selected_codes = [opt.split(" - ")[0] for opt in selected]
+                st.session_state.prereqs[module] = selected_codes
+        
+        # Add validation button
+        if st.button("🔍 Validate Prerequisites"):
+            # Check for missing modules in prerequisites
+            invalid_prereqs = {}
+            for module, prereqs in st.session_state.prereqs.items():
+                for prereq in prereqs:
+                    if prereq not in modules:
+                        invalid_prereqs.setdefault(module, []).append(prereq)
+            
+            if invalid_prereqs:
+                st.warning("⚠️ Found invalid prerequisites:")
+                for module, invalids in invalid_prereqs.items():
+                    st.write(f"- {module}: {', '.join(invalids)}")
+                st.info("These prerequisites will be ignored during scheduling")
+            else:
+                st.success("✅ All prerequisites reference valid modules!")
+            
+            # Check for circular dependencies
+            scheduler = CohortScheduler(
+                modules=modules,
+                prereqs=st.session_state.prereqs,
+                cohort_starts={'C1': 1},  # Dummy cohort for validation
+                config=SchedulerConfig(max_terms=10)
+            )
+            cycles = scheduler.detect_cycles()
+            if cycles:
+                st.error("❌ Found circular dependencies:")
+                for cycle in cycles:
+                    st.write(f"→ {' → '.join(cycle)} → {cycle[0]}")
+                st.info("Fix these cycles before running the scheduler")
+            else:
+                st.success("✅ No circular dependencies detected!")
+
+    # Display current configuration
+    st.divider()
+    st.subheader("Current Prerequisite Configuration")
+    
+    config_display = []
+    for module in modules:
+        prereq_list = st.session_state.prereqs.get(module, [])
+        if prereq_list:
+            prereq_names = [f"{p} ({module_names[p]})" for p in prereq_list if p in module_names]
+            config_display.append(f"**{module} ({module_names[module]}):** {', '.join(prereq_names)}")
+        else:
+            config_display.append(f"**{module} ({module_names[module]}):** No Prerequisites")
+    
+    st.markdown("\n\n".join(config_display))
+
+with tab2:
+    st.header("Run Scheduler")
+    
+    # Configuration options
+    col1, col2 = st.columns(2)
+    with col1:
+        max_terms = st.number_input("Maximum Terms", min_value=10, max_value=200, value=50,
+                                  help="Maximum number of terms to consider for scheduling")
+    with col2:
+        modules_per_term = st.number_input("Max Modules per Cohort per Term", min_value=1, max_value=5, value=1,
+                                          help="How many modules a cohort can take in a single term")
+    
+    # Cohort configuration
+    st.subheader("Cohort Start Terms")
+    st.caption("Configure when each cohort begins their studies")
+    
+    cohort_starts = {}
+    cohort_cols = st.columns(4)
+    for i, cohort in enumerate([f'C{i+1}' for i in range(8)]):
+        with cohort_cols[i % 4]:
+            cohort_starts[cohort] = st.number_input(
+                f"Start term for {cohort}",
+                min_value=1,
+                max_value=50,
+                value=i*2 + 1,
+                key=f"cohort_{cohort}"
+            )
+    
+    if st.button("🚀 Run Scheduler", type="primary", use_container_width=True):
+        with st.spinner("Running optimization..."):
+            # Capture output
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+            
+            try:
+                # Run scheduler
+                config = SchedulerConfig(
+                    max_terms=max_terms,
+                    max_modules_per_cohort_per_term=modules_per_term,
+                    verbose=False
+                )
+                
+                optimized = CohortScheduler(
+                    modules=modules,
+                    prereqs=st.session_state.prereqs,
+                    cohort_starts=cohort_starts,
+                    config=config
+                )
+                
+                success = optimized.find_optimal_schedule()
+                summary = optimized.get_schedule_summary()
+                
+                # Store results in session state
+                st.session_state.scheduler = optimized
+                st.session_state.summary = summary
+                st.session_state.success = success
+                st.session_state.cohort_starts = cohort_starts
+                
+                output = sys.stdout.getvalue()
+                sys.stdout = old_stdout
+                
+                if success:
+                    st.success("✅ Scheduling completed successfully!")
+                else:
+                    st.warning("⚠️ Scheduling completed with incomplete cohorts")
+                
+                # Show summary metrics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Module Runs", summary['total_runs'])
+                with col2:
+                    st.metric("Schedule Length", f"{summary['max_term']} terms")
+                with col3:
+                    baseline_runs = 8 * 12  # 8 cohorts * 12 modules
+                    improvement = (baseline_runs - summary['total_runs']) / baseline_runs * 100
+                    st.metric("Improvement vs Baseline", f"{improvement:.1f}%")
+                
+                st.info("✨ Go to the 'Results' tab to view detailed schedule and download CSV files.")
+                
+            except Exception as e:
+                sys.stdout = old_stdout
+                st.error(f"❌ Error running scheduler: {str(e)}")
+                st.exception(e)
+
+with tab3:
+    st.header("Results & Downloads")
+    
+    if 'scheduler' not in st.session_state:
+        st.info("👈 Please run the scheduler first in the 'Run Scheduler' tab.")
+        st.image("https://streamlit.io/images/hero.png", width=300, caption="Run scheduler to see results")
+    else:
+        scheduler = st.session_state.scheduler
+        summary = st.session_state.summary
+        cohort_starts = st.session_state.cohort_starts
+        
+        # Download buttons
+        st.subheader("📥 Download CSV Files")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        # Generate CSVs
+        def generate_term_csv():
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Term', 'Module_Code', 'Module_Name', 'Cohorts'])
+            for term in sorted(scheduler.schedule.keys()):
+                for module, cohorts in scheduler.schedule[term].items():
+                    writer.writerow([term, module, module_names[module], ','.join(sorted(cohorts))])
+            return output.getvalue()
+        
+        def generate_cohort_csv():
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Cohort', 'Module_Code', 'Module_Name', 'Term_Taken', 'Start_Term'])
+            for cohort in sorted(scheduler.cohort_progress.keys()):
+                start_term = cohort_starts[cohort]
+                for module, term in sorted(scheduler.cohort_progress[cohort].items(), key=lambda x: x[1]):
+                    writer.writerow([cohort, module, module_names[module], term, start_term])
+            return output.getvalue()
+        
+        def generate_metrics_csv():
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Metric', 'Baseline', 'Optimized', 'Improvement_Percent'])
+            baseline_runs = 8 * 12  # 8 cohorts * 12 modules
+            opt_runs = summary['total_runs']
+            improvement = (baseline_runs - opt_runs) / baseline_runs * 100 if baseline_runs > 0 else 0
+            writer.writerow(['Total_Module_Runs', baseline_runs, opt_runs, f"{improvement:.2f}"])
+            writer.writerow(['Schedule_Length', 'N/A', summary['max_term'], 'N/A'])
+            return output.getvalue()
+        
+        def generate_mapping_csv():
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(['Module_Code', 'Module_Name', 'Terms_Offered', 'Run_Count'])
+            for module in sorted(module_names.keys()):
+                terms = sorted(scheduler.module_runs[module])
+                writer.writerow([module, module_names[module], ','.join(map(str, terms)), len(terms)])
+            return output.getvalue()
+        
+        with col1:
+            st.download_button(
+                "📄 Term Schedule",
+                generate_term_csv(),
+                "term_by_term_schedule.csv",
+                "text/csv",
+                help="Schedule showing which modules run each term and which cohorts attend"
+            )
+        
+        with col2:
+            st.download_button(
+                "📄 Cohort Progression",
+                generate_cohort_csv(),
+                "cohort_progression.csv",
+                "text/csv",
+                help="Complete progression of each cohort through all modules"
+            )
+        
+        with col3:
+            st.download_button(
+                "📊 Metrics",
+                generate_metrics_csv(),
+                "metrics_comparison.csv",
+                "text/csv",
+                help="Comparison of optimized schedule vs baseline (one module run per cohort)"
+            )
+        
+        with col4:
+            st.download_button(
+                "🔍 Module Mapping",
+                generate_mapping_csv(),
+                "module_term_mapping.csv",
+                "text/csv",
+                help="Mapping of which modules run in which terms"
+            )
+        
+        # Display detailed results
+        st.divider()
+        # Term-by-Cohort Matrix View
+        st.subheader("📊 Term × Cohort Matrix View")
+        if not scheduler.schedule:
+            st.info("No schedule generated. Check for errors in prerequisites or configuration.")
+        else:
+            max_term = summary['max_term']
+            
+            # Create data structure for the matrix
+            matrix_data = []
+            
+            # Header row
+            header_row = ["Term","Date"]
+            for cohort in sorted(scheduler.cohorts):
+                header_row.append(f"Cohort {cohort}")
+            matrix_data.append(header_row)
+            
+            # Data rows for each term
+            for term in range(1, max_term + 1):
+                row = [f"T{term}"]
+                row.append(get_term_date(term))
+                # For each cohort, find modules scheduled in this term
+                for cohort in sorted(scheduler.cohorts):
+                    modules_in_term = []
+                    # Check all modules scheduled in this term
+                    if term in scheduler.schedule:
+                        for module, cohorts in scheduler.schedule[term].items():
+                            if cohort in cohorts:
+                                modules_in_term.append(module_names[module])
+                    
+                    if modules_in_term:
+                        # Join multiple modules with line breaks for better readability in cells
+                        row.append("\n".join(modules_in_term))
+                    else:
+                        row.append("")
+                matrix_data.append(row)
+            
+            # Convert to pandas DataFrame for better display
+            import pandas as pd
+            df = pd.DataFrame(matrix_data[1:], columns=matrix_data[0])
+            
+            # Style the dataframe
+            styled_df = df.style.set_properties(**{
+                'text-align': 'left',
+                'white-space': 'pre-wrap',
+                'vertical-align': 'top'
+            }).set_table_styles([
+                {'selector': 'th', 'props': [('background-color', '#f0f2f6'), ('font-weight', 'bold')]},
+                {'selector': 'td', 'props': [('border', '1px solid #e0e0e0'), ('padding', '8px')]},
+                {'selector': 'tr:hover', 'props': [('background-color', '#f9f9f9')]}
+            ])
+            
+            # Display the styled dataframe
+            st.dataframe(styled_df, height=600, use_container_width=True)
+            
+            # Create CSV for spreadsheet download - Term × Cohort Matrix
+            def generate_matrix_csv():
+                import csv
+                import io
+                
+                output = io.StringIO()
+                writer = csv.writer(output)
+                
+                # Write header row
+                writer.writerow(["Term", "Date"] + [f"Cohort {c}" for c in sorted(scheduler.cohorts)])
+                
+                # Write data rows
+                for term in range(1, max_term + 1):
+                    term_date = TERM_DATES[term]
+                    row = [f"T{term}", term_date]
+                    for cohort in sorted(scheduler.cohorts):
+                        modules_in_term = []
+                        if term in scheduler.schedule:
+                            for module, cohorts in scheduler.schedule[term].items():
+                                if cohort in cohorts:
+                                    modules_in_term.append(module_names[module])
+                        
+                        if modules_in_term:
+                            row.append("; ".join(modules_in_term))
+                        else:
+                            row.append("")
+                    writer.writerow(row)
+                
+                return output.getvalue()
+                    # Download button for term dates
+        def generate_term_dates_csv():
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['Term', 'Date'])
+                for term in range(1, 27):
+                    writer.writerow([f"Term {term}", get_term_date(term)])
+                return output.getvalue()
+                # Add download button for spreadsheet format
+        st.download_button(
+                    "📥 Download Term×Cohort Matrix (CSV)",
+                    generate_matrix_csv(),
+                    "term_cohort_matrix.csv",
+                    "text/csv",
+                    help="Download in spreadsheet format with terms as rows and cohorts as columns"
+                    )
+        # Module-term mapping - SHOW ALL MODULES BY DEFAULT
+        st.subheader("🗺️ Module-Term Mapping for All Modules")
+        
+        # Create expanders for each module
+        for module in sorted(module_names.keys()):
+            with st.expander(f"{module_names[module]} ({module})"):
+                if module in scheduler.module_runs:
+                    terms = sorted(scheduler.module_runs[module])
+                    if terms:
+                        st.markdown(f"**Offered in terms:** {', '.join(map(str, terms))}")
+                        st.markdown(f"**Total runs:** {len(terms)}")
+                        
+                        # Visual timeline
+                        max_term = max(terms + [1])
+                        timeline = ["▢"] * (max_term + 1)
+                        for t in terms:
+                            if t <= max_term:
+                                timeline[t] = "✅"
+                        timeline_str = "".join(timeline[1:])
+                        st.markdown(f"**Term timeline:** `1`{''.join(timeline[1:])}`{max_term}`")
+                    else:
+                        st.info(f"Module {module} is never scheduled")
+                else:
+                    st.warning(f"Module {module} not found in schedule")    
+        # Term-by-term schedule - REVISED FORMAT
+        st.subheader("📅 Term-by-Term Schedule (Detailed View)") 
+        
+        if not scheduler.schedule:
+            st.info("No schedule generated. Check for errors in prerequisites or configuration.")
+        else:
+            max_term = summary['max_term']
+            schedule_lines = []
+            
+            # Header
+            schedule_lines.append("="*80)
+            schedule_lines.append("DETAILED OPTIMIZED SCHEDULE (Term-by-Term)")
+            schedule_lines.append("="*80)
+            
+            # Generate schedule lines for all terms from 1 to max_term
+            for term in range(1, max_term + 1):
+                if term in scheduler.schedule and scheduler.schedule[term]:
+                    modules_in_term = []
+                    # Sort modules by module code for consistent ordering
+                    for module in sorted(scheduler.schedule[term].keys()):
+                        cohorts = sorted(scheduler.schedule[term][module])
+                        cohort_str = ', '.join(cohorts)
+                        modules_in_term.append(f"{module_names[module]} ({cohort_str})")
+                    
+                    # Join modules with tab separation
+                    term_line = f"T{term}: " + "\t".join(modules_in_term)
+                    schedule_lines.append(term_line)
+                else:
+                    # For empty terms, show placeholder
+                    schedule_lines.append(f"T{term}: (no modules scheduled)")
+            
+            # Footer
+            schedule_lines.append("="*80)
+            
+            # Display as monospace text
+            schedule_text = "\n".join(schedule_lines)
+            st.text(schedule_text)
+            
+            # Create CSV for spreadsheet download - Term-by-Term
+            def generate_term_csv_spreadsheet():
+                import csv
+                import io
+                
+                output = io.StringIO()
+                writer = csv.writer(output)
+                
+                # Write header row
+                writer.writerow(['Term', 'Module 1', 'Module 2', 'Module 3', 'Module 4', 'Module 5', 'Module 6', 'Module 7', 'Module 8', 'Module 9', 'Module 10', 'Module 11', 'Module 12'])
+                
+                # Write data rows
+                for term in range(1, max_term + 1):
+                    row = [f"T{term}"]
+                    if term in scheduler.schedule and scheduler.schedule[term]:
+                        # Sort modules by module code
+                        for module in sorted(scheduler.schedule[term].keys()):
+                            cohorts = sorted(scheduler.schedule[term][module])
+                            cohort_str = ', '.join(cohorts)
+                            row.append(f"{module_names[module]} ({cohort_str})")
+                    writer.writerow(row)
+                
+                return output.getvalue()
+            
+            # Add download button for spreadsheet format
+            st.download_button(
+                "📊 Download Term Schedule (CSV)",
+                generate_term_csv_spreadsheet(),
+                "term_schedule_spreadsheet.csv",
+                "text/csv",
+                help="Download in spreadsheet format with terms as rows and modules as columns"
+            )
+        
+        # Cohort progression - REVISED HORIZONTAL FORMAT
+        st.subheader("👥 Cohort Progression (Horizontal View)")
+        if not scheduler.cohort_progress:
+            st.info("No cohort progression data available.")
+        else:
+            cohort_lines = []
+            
+            # Header
+            cohort_lines.append("="*80)
+            cohort_lines.append("PER-COHORT MODULE PROGRESSION")
+            cohort_lines.append("="*80)
+            
+            # Generate progression lines for all cohorts
+            for cohort in sorted(scheduler.cohort_progress.keys()):
+                if cohort in scheduler.cohort_progress:
+                    modules_in_cohort = []
+                    # Sort modules by term taken
+                    sorted_modules = sorted(
+                        scheduler.cohort_progress[cohort].items(),
+                        key=lambda x: x[1]
+                    )
+                    
+                    for module, term in sorted_modules:
+                        modules_in_cohort.append(f"{module_names[module]}(T{term})")
+                    
+                    # Join modules with tab separation
+                    cohort_line = f"{cohort}: " + "\t".join(modules_in_cohort)
+                    cohort_lines.append(cohort_line)
+                else:
+                    cohort_lines.append(f"{cohort}: (no modules scheduled)")
+            
+            # Footer
+            cohort_lines.append("="*80)
+            
+            # Display as monospace text
+            cohort_text = "\n".join(cohort_lines)
+            st.text(cohort_text)
+            
+            # Create CSV for spreadsheet download - Cohort Progression
+            def generate_cohort_csv_spreadsheet():
+                import csv
+                import io
+                
+                output = io.StringIO()
+                writer = csv.writer(output)
+                
+                # Write header row
+                writer.writerow(['Cohort', 'Module 1', 'Module 2', 'Module 3', 'Module 4', 'Module 5', 'Module 6', 'Module 7', 'Module 8', 'Module 9', 'Module 10', 'Module 11', 'Module 12'])
+                
+                # Write data rows
+                for cohort in sorted(scheduler.cohort_progress.keys()):
+                    row = [cohort]
+                    if cohort in scheduler.cohort_progress:
+                        # Sort modules by term taken
+                        sorted_modules = sorted(
+                            scheduler.cohort_progress[cohort].items(),
+                            key=lambda x: x[1]
+                        )
+                        for module, term in sorted_modules:
+                            row.append(f"{module_names[module]}(T{term})")
+                    writer.writerow(row)
+                
+                return output.getvalue()
+            
+            # Add download button for spreadsheet format
+            st.download_button(
+                "📊 Download Cohort Progression (CSV)",
+                generate_cohort_csv_spreadsheet(),
+                "cohort_progression_spreadsheet.csv",
+                "text/csv",
+                help="Download in spreadsheet format with cohorts as rows and modules as columns"
+            )  
+            
+
+            st.caption("💡 Tip: This view shows which modules each cohort takes in each term. Hover over cells to see full content, or download the CSV for complete details.")       
+
+
+# Footer
+st.divider()
+st.markdown("""
+**💡 Tips for Better Schedules:**
+- Start with foundational modules having no prerequisites
+- Avoid circular dependencies (A requires B, B requires A)
+- Increase 'Max Modules per Cohort per Term' for faster completion
+- Adjust cohort start terms to balance resource usage
+- Use presets as starting points for your configuration
+""")
+
+st.caption("Scheduler v2.1 • Handles 12 modules and 8 cohorts • Uses greedy optimization algorithm")
+
+
+
+
